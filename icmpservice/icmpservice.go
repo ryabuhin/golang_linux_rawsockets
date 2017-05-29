@@ -52,42 +52,25 @@ func sendICMPPacketTo(fd int, destAddr syscall.SockaddrInet4, icmppacket []byte)
 func receiveICMPPacketFrom(fd int, destAddr syscall.SockaddrInet4) bool {
 	icmppacket := make([]byte, 28)
 	socketF := os.NewFile(uintptr(fd), fmt.Sprintf("sock%v", fd))
-	recvReply := true
 	defer socketF.Close()
 	for {
-		recvReply = true
 		rb, err := socketF.Read(icmppacket)
 		if rb >= 28 && err == nil && icmppacket[20] == 0x0 { // if it's ICMP ECHO reply packet
-			for i, val := range icmppacket[12:16] {
-				if destAddr.Addr[i] != val {
-					recvReply = false
-					break
-				}
-			}
-			if recvReply {
-				break
+			if reflect.DeepEqual(icmppacket[12:16], destAddr.Addr[:]) {
+				return true
 			}
 		}
 	}
-	return recvReply
 }
 
 func receiveMyExceededICMPPackets(fd int, origpacket []byte) {
 	icmppacket := make([]byte, 56)
 	socketF := os.NewFile(uintptr(fd), fmt.Sprintf("sock%v", fd))
 	defer socketF.Close()
-	var rcvourpacket bool
 	for {
-		rcvourpacket = true
 		rb, err := socketF.Read(icmppacket)
 		if rb >= 28 && err == nil && icmppacket[20] == 0x0B { // if it's ICMP TTL exceeded
-			for i, val := range icmppacket[48:] {
-				if val != origpacket[i] {
-					rcvourpacket = false
-					break
-				}
-			}
-			if rcvourpacket {
+			if reflect.DeepEqual(icmppacket[48:], origpacket[:]) {
 				fmt.Println(fmt.Sprintf("%v.%v.%v.%v", icmppacket[12], icmppacket[13], icmppacket[14], icmppacket[15]))
 			}
 		}
