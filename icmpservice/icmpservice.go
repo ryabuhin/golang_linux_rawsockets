@@ -3,7 +3,9 @@ package icmpservice
 import (
 	"encoding/hex"
 	"fmt"
+	"math/rand"
 	"os"
+	"reflect"
 	"syscall"
 	"time"
 )
@@ -39,13 +41,7 @@ func ReceiveAllICMPPackets() {
 }
 
 // sendICMPPacket is function for sending ICMP packet(ECHO_REQEUST) on remote/localhost machine
-func sendICMPPacketTo(fd int, destAddr syscall.SockaddrInet4) {
-	// creating simple echo request
-	icmppacket := make([]byte, 8)
-	icmppacket[0] = 0x8
-	calcsum := CalculateСsumPacket(icmppacket)
-	icmppacket[2] = uint8((calcsum >> 8) & 0xFF)
-	icmppacket[3] = uint8(calcsum & 0xFF)
+func sendICMPPacketTo(fd int, destAddr syscall.SockaddrInet4, icmppacket []byte) {
 	err := syscall.Sendto(fd, icmppacket, 0, &destAddr)
 	if err != nil {
 		fmt.Println("ERROR, can't send ICMP packet")
@@ -53,25 +49,46 @@ func sendICMPPacketTo(fd int, destAddr syscall.SockaddrInet4) {
 	}
 }
 
-func receiveICMPPacketFrom(fd int, destAddr syscall.SockaddrInet4) {
+func receiveICMPPacketFrom(fd int, destAddr syscall.SockaddrInet4) bool {
 	icmppacket := make([]byte, 28)
-	isAlive := true
 	socketF := os.NewFile(uintptr(fd), fmt.Sprintf("sock%v", fd))
+	recvReply := true
 	defer socketF.Close()
-
-	go noresponse()
 	for {
+		recvReply = true
 		rb, err := socketF.Read(icmppacket)
-		if rb >= 28 && err == nil && icmppacket[21] == 0x0 { // if it's ICMP ECHO reply packet
-			for i, val := range icmppacket[12:15] {
+		if rb >= 28 && err == nil && icmppacket[20] == 0x0 { // if it's ICMP ECHO reply packet
+			for i, val := range icmppacket[12:16] {
 				if destAddr.Addr[i] != val {
-					isAlive = false
+					recvReply = false
 					break
 				}
 			}
-			if isAlive {
-				fmt.Println("Host is alive!")
+			if recvReply {
 				break
+			}
+		}
+	}
+	return recvReply
+}
+
+func receiveMyExceededICMPPackets(fd int, origpacket []byte) {
+	icmppacket := make([]byte, 56)
+	socketF := os.NewFile(uintptr(fd), fmt.Sprintf("sock%v", fd))
+	defer socketF.Close()
+	var rcvourpacket bool
+	for {
+		rcvourpacket = true
+		rb, err := socketF.Read(icmppacket)
+		if rb >= 28 && err == nil && icmppacket[20] == 0x0B { // if it's ICMP TTL exceeded
+			for i, val := range icmppacket[48:] {
+				if val != origpacket[i] {
+					rcvourpacket = false
+					break
+				}
+			}
+			if rcvourpacket {
+				fmt.Println(fmt.Sprintf("%v.%v.%v.%v", icmppacket[12], icmppacket[13], icmppacket[14], icmppacket[15]))
 			}
 		}
 	}
@@ -84,8 +101,71 @@ func IsAlive(ipbytes [4]byte) {
 		Addr: ipbytes,
 	}
 	fd := initSocket()
-	sendICMPPacketTo(fd, destAddr)
-	receiveICMPPacketFrom(fd, destAddr)
+	icmppacket := createSimpleEchoRequest()
+	sendICMPPacketTo(fd, destAddr, icmppacket)
+	go noresponse()
+	if receiveICMPPacketFrom(fd, destAddr) {
+		fmt.Println("Host is alive!")
+	}
+}
+
+// TraceRouteWithTTL function for trace routing
+func TraceRouteWithTTL(ipbytes [4]byte) {
+	fmt.Println("TRACEROUTE START (THIS ->", ipbytes, ")\n")
+	destAddr := syscall.SockaddrInet4{
+		Port: 0,
+		Addr: ipbytes,
+	}
+	fd := initSocket()
+	icmppacket := createSimpleEchoRequest()
+	socketF := os.NewFile(uintptr(fd), fmt.Sprintf("sock%v", fd))
+	defer socketF.Close()
+	for i := 1; ; i++ {
+		fmt.Print(" ", i, ".\t")
+		syscall.SetsockoptByte(fd, syscall.IPPROTO_IP, syscall.IP_TTL, uint8(i))
+		curtime := time.Now()
+		sendICMPPacketTo(fd, destAddr, icmppacket)
+		rcvicmppacket := make([]byte, 56)
+		rb, err := socketF.Read(rcvicmppacket)
+		recvtime := fmt.Sprintf("%.2f ms", float64(time.Since(curtime))/1e6)
+		if rb >= 28 && err == nil {
+			switch rcvicmppacket[20] {
+			case 0x0: // if it's ICMP ECHO reply
+				{
+					if reflect.DeepEqual(rcvicmppacket[12:16], ipbytes[:]) {
+						fmt.Println(fmt.Sprintf("%v.%v.%v.%v\t(ECHO reply)\t\t%s\n\nTRACEROUTE END", rcvicmppacket[12],
+							rcvicmppacket[13], rcvicmppacket[14], rcvicmppacket[15], recvtime))
+						os.Exit(0)
+					}
+				}
+			case 0x0B: // if it's ICMP TTL exceeded
+				{
+					if reflect.DeepEqual(rcvicmppacket[48:], icmppacket[:]) {
+						fmt.Println(fmt.Sprintf("%v.%v.%v.%v\t(TTL exceeded)\t\t%s", rcvicmppacket[12], rcvicmppacket[13],
+							rcvicmppacket[14], rcvicmppacket[15], recvtime))
+					}
+				}
+			default:
+				{
+					if reflect.DeepEqual(rcvicmppacket[48:], icmppacket[:]) {
+						fmt.Println(fmt.Sprintf("%v.%v.%v.%v\t(Other: %vt/%vc)\t\t%s", rcvicmppacket[12], rcvicmppacket[13],
+							rcvicmppacket[14], rcvicmppacket[15], rcvicmppacket[20], rcvicmppacket[21], recvtime))
+					}
+				}
+			}
+		}
+	}
+}
+
+// Function for creating simple echo icmp request
+func createSimpleEchoRequest() []byte {
+	request := make([]byte, 8)
+	request[0] = 0x8
+	request[4] = uint8(rand.Int())
+	calcsum := CalculateСsumPacket(request)
+	request[2] = uint8((calcsum >> 8) & 0xFF)
+	request[3] = uint8(calcsum & 0xFF)
+	return request
 }
 
 // CalculateСsumPacket is function for calc. csum for any packets(IP/ICMP/TCP/UDP etc)

@@ -19,6 +19,7 @@ func main() {
 		}
 	case "--traceroute":
 		{
+			icmpservice.TraceRouteWithTTL(parseIP(os.Args[2]))
 			os.Exit(1)
 		}
 	case "--recvall":
