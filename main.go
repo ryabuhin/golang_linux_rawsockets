@@ -26,6 +26,11 @@ func main() {
 		{
 			os.Exit(1)
 		}
+	case "--redirhost":
+		{
+			icmpservice.IcmpRedirectHost(parseIP(os.Args[2]), parseIP(os.Args[3]), parseIP(os.Args[4]),
+				parseIP(os.Args[5]))
+		}
 	}
 	os.Exit(0)
 }

